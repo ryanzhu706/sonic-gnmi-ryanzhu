@@ -17,7 +17,6 @@ def _run(cmd, **kw):
 
 def pytest_addoption(parser):
     g = parser.getgroup("gNOI e2e")
-    # 通用
     g.addoption("--dut", help="DUT mgmt IP or 'user@host' for SSH (docker deploy needs 'admin@IP')", default=None)
     g.addoption("--ptf", help="PTF host for running agent (if omitted, run agent locally)", default=None)
     g.addoption("--port", help="gNOI server port", default="50055")
