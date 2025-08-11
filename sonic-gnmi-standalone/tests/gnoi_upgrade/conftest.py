@@ -1,128 +1,108 @@
-import subprocess
 import os
+import subprocess
 import time
+import tempfile
+import hashlib
+from pathlib import Path
 import pytest
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-AGENT_BIN_LOCAL = os.path.join(PROJECT_ROOT, "bin/upgrade-agent")
-AGENT_BIN_REMOTE = "/tmp/upgrade-agent"
+REPO_ROOT = Path(__file__).resolve().parents[1]  # sonic-gnmi/
+STANDALONE = REPO_ROOT / "sonic-gnmi-standalone"
+AGENT_BIN = STANDALONE / "bin" / "upgrade-agent"
+BAREMETAL = STANDALONE / "docker" / "build_run_baremetal_testonly.sh"
+DOCKER_DEPLOY = STANDALONE / "docker" / "build_run_docker_testonly.sh"
 
+def _run(cmd, **kw):
+    return subprocess.run(cmd, text=True, check=True, capture_output=True, **kw)
 
-# ========================
-# Build / deploy functions
-# ========================
-def make_build():
-    """Build server and agent binaries"""
-    subprocess.run(["make", "build"], cwd=PROJECT_ROOT, check=True)
-    assert os.path.exists(AGENT_BIN_LOCAL), "upgrade-agent binary not built"
+def pytest_addoption(parser):
+    g = parser.getgroup("gNOI e2e")
+    # 通用
+    g.addoption("--dut", help="DUT mgmt IP or 'user@host' for SSH (docker deploy needs 'admin@IP')", default=None)
+    g.addoption("--ptf", help="PTF host for running agent (if omitted, run agent locally)", default=None)
+    g.addoption("--port", help="gNOI server port", default="50055")
+    g.addoption("--url",  help="image/file URL to download", default="http://httpbin.org/robots.txt")
+    g.addoption("--dest", help="destination path on DUT filesystem", default="/tmp/sonic-test.bin")
+    g.addoption("--use-baremetal-local", action="store_true", help="start server locally via baremetal script (dev/debug)")
+    g.addoption("--tls", action="store_true", help="use TLS when agent connects (server must be started with TLS)")
+    g.addoption("--scenario", choices=["kvm-pr-gnmi","kvm-pr-buildimage","physical-nightly","dev-local"], default="kvm-pr-gnmi")
 
+@pytest.fixture(scope="session")
+def cfg(pytestconfig):
+    return {
+        "dut": pytestconfig.getoption("--dut"),
+        "ptf": pytestconfig.getoption("--ptf"),
+        "port": pytestconfig.getoption("--port"),
+        "url": pytestconfig.getoption("--url"),
+        "dest": pytestconfig.getoption("--dest"),
+        "use_baremetal_local": pytestconfig.getoption("--use-baremetal-local"),
+        "tls": pytestconfig.getoption("--tls"),
+        "scenario": pytestconfig.getoption("--scenario"),
+    }
 
-def verify_grpc_connectivity(server_addr):
-    """Verify gNOI server is working properly"""
-    result = subprocess.run(["grpcurl", "-plaintext", server_addr, "list"],
-                            capture_output=True, text=True)
-    print("gRPC Services:\n", result.stdout)
-    assert result.returncode == 0, f"grpcurl failed: {result.stderr}"
-    assert "gnoi.system.System" in result.stdout
+@pytest.fixture(scope="session")
+def build_bins():
+    _run(["make", "build"], cwd=STANDALONE)
+    assert AGENT_BIN.exists(), f"agent missing: {AGENT_BIN}"
+    return {"agent": str(AGENT_BIN)}
 
+@pytest.fixture(scope="session")
+def deploy_server(cfg, build_bins):
+    """
+    Deploy gNOI server, yield its address (host:port)
+      - Dev/Local: local baremetal server (requires --use-baremetal-local)
+      - KVM-PR-gnmi: docker deploy to KVM PR testbed (requires --dut=admin@<ip>)
+      - KVM-PR-buildimage: docker deploy to KVM PR build image (requires --dut=admin@<ip>)
+      - Nightly physical: docker deploy to nightly physical testbed (requires --dut=admin@<ip>)
+    """
+    port = cfg["port"]
+    if cfg["use_baremetal_local"]:
+        # Local baremetal server
+        _ = subprocess.Popen([str(BAREMETAL), "-a", f":{port}"])
+        time.sleep(2)
+        addr = f"localhost:{port}"
+        yield addr
+        subprocess.run(["pkill", "-f", "sonic-gnmi-standalone"], check=False)
+        return
 
-# ========================
-# Deploy server functions encapsulation
-# ========================
-def deploy_server_baremetal_local(port="50055"):
-    script = os.path.join(PROJECT_ROOT, "docker/build_run_baremetal_testonly.sh")
-    subprocess.Popen([script, "-a", f":{port}"])
+    # Docker deploy
+    assert cfg["dut"], "--dut is required for docker deploy"
+    target = cfg["dut"] if "@" in cfg["dut"] else f"admin@{cfg['dut']}"
+    _run([str(DOCKER_DEPLOY), "-t", target, "-a", f":{port}"])
+    addr = f"{target.split('@')[-1]}:{port}"
     time.sleep(2)
-
-def deploy_server_docker_remote(host, port="50055", user="admin"):
-    script = os.path.join(PROJECT_ROOT, "docker/build_run_docker_testonly.sh")
-    subprocess.run(
-        [script, "-t", f"{user}@{host}", "-a", f":{port}"],
-        check=True
-    )
-    time.sleep(2)
-
-def stop_server_local():
-    subprocess.run(["pkill", "-f", "sonic-gnmi-standalone"], check=False)
-
-def stop_server_docker(host, user="admin"):
-    subprocess.run(["ssh", f"{user}@{host}", "docker rm -f gnmi-standalone-testonly || true"],
-                   check=False)
-
-
-# ========================
-# Agent operations encapsulation
-# ========================
-def run_agent_apply(server_addr, workflow_file, remote_host=None, user="admin"):
-    if remote_host:
-        cmd = f"{AGENT_BIN_REMOTE} apply {workflow_file} --server {server_addr}"
-        subprocess.run(["ssh", f"{user}@{remote_host}", cmd],
-                       check=True, capture_output=True, text=True)
-    else:
-        subprocess.run([AGENT_BIN_LOCAL, "apply", workflow_file, "--server", server_addr],
-                       check=True)
-
-def run_agent_download(server_addr, url, dest_file, md5, remote_host=None, user="admin"):
-    if remote_host:
-        cmd = f"{AGENT_BIN_REMOTE} download --server {server_addr} --url {url} --file {dest_file} --md5 {md5}"
-        subprocess.run(["ssh", f"{user}@{remote_host}", cmd],
-                       check=True, capture_output=True, text=True)
-    else:
-        subprocess.run([
-            AGENT_BIN_LOCAL, "download", "--server", server_addr,
-            "--url", url, "--file", dest_file, "--md5", md5
-        ], check=True)
-
-
-# ========================
-# deploy agent to ptf
-# ========================
-def deploy_agent_to_remote(ptf_host, user="admin"):
-    subprocess.run(["scp", AGENT_BIN_LOCAL, f"{user}@{ptf_host}:{AGENT_BIN_REMOTE}"], check=True)
-
-
-# ========================
-# Fixtures
-# ========================
-@pytest.fixture(scope="session")
-def local_vm_scenario():
-    port = "50055"
-    make_build()
-    deploy_server_baremetal_local(port)
-    verify_grpc_connectivity(f"localhost:{port}")
-    yield {
-        "server_addr": f"localhost:{port}",
-        "workflow_file": os.path.join(PROJECT_ROOT, "tests/workflows/workflow-local-vm.yaml")
-    }
-    stop_server_local()
-
+    yield addr
+    # Cleanup docker container
+    host = target.split("@")[-1]
+    subprocess.run(["ssh", target, "docker rm -f gnmi-standalone-testonly || true"], check=False)
 
 @pytest.fixture(scope="session")
-def kvm_scenario():
-    kvm_host = "10.0.0.10"
-    port = "50055"
-    make_build()
-    deploy_server_docker_remote(kvm_host, port=port)
-    verify_grpc_connectivity(f"{kvm_host}:{port}")
-    yield {
-        "server_addr": f"{kvm_host}:{port}",
-        "workflow_file": os.path.join(PROJECT_ROOT, "tests/workflows/workflow-kvm.yaml")
-    }
-    stop_server_docker(kvm_host)
-
+def md5sum(cfg):
+    data = _run(["curl", "-fsSL", cfg["url"]]).stdout.encode()
+    return hashlib.md5(data).hexdigest()
 
 @pytest.fixture(scope="session")
-def physical_scenario():
-    dut_host = "192.168.1.100"
-    ptf_host = "192.168.1.200"
-    port = "50055"
-    make_build()
-    deploy_server_docker_remote(dut_host, port=port)
-    deploy_agent_to_remote(ptf_host)
-    verify_grpc_connectivity(f"{dut_host}:{port}")
-    yield {
-        "server_addr": f"{dut_host}:{port}",
-        "workflow_file": "/tmp/workflow-physical.yaml",
-        "ptf_host": ptf_host
-    }
-    stop_server_docker(dut_host)
+def agent_runner(cfg, build_bins):
+    """
+    Returns a function to run the upgrade-agent binary, either locally or on PTF.
+    Usage:
+        run_agent = agent_runner(cfg, build_bins)
+        output = run_agent(["download", "--server", "   addr:port", "--url", "http://...", "--dest", "/tmp/file"])
+    """
+    agent_local = build_bins["agent"]
+
+    def _ensure_ptf_has_agent(ptf):
+        subprocess.run(["scp", agent_local, f"{ptf}:/tmp/upgrade-agent"], check=True)
+        subprocess.run(["ssh", ptf, "chmod +x /tmp/upgrade-agent"], check=True)
+
+    def _run_agent(args: list[str], where="local"):
+        if where == "local":
+            return _run([agent_local] + args).stdout
+        assert cfg["ptf"], "--ptf must be provided to run agent on PTF"
+        ptf = cfg["ptf"] if "@" in cfg["ptf"] else f"root@{cfg['ptf']}"
+        _ensure_ptf_has_agent(ptf)
+        cmd = " ".join(["/tmp/upgrade-agent"] + args)
+        out = _run(["ssh", ptf, cmd]).stdout
+        return out
+
+    return _run_agent
