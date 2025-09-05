@@ -29,8 +29,14 @@ steps:
     sudo apt-get install -y \
       build-essential \
       golang-go \
+      libyang-dev \
+      libnl-3-dev \
+      libnl-genl-3-dev \
+      curl \
+      git \
+      python3-pip
     pip install semgrep
-  displayName: 'Install dependencies'
+  displayName: 'Install minimal dependencies'
 
 - script: |
     go version
@@ -40,7 +46,6 @@ steps:
 
 - script: |
     cd sonic-gnmi-standalone
-    echo "Running Continuous Integration checks..."
-    ## echo "Hint: you can also run these locally..."
     make ci
-  displayName: 'Run CI pipeline'
+  displayName: 'Run make ci'
+
