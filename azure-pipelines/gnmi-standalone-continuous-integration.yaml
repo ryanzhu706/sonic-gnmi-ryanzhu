@@ -12,7 +12,7 @@ pr:
       - feature/*
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: 'ubuntu-22.04'
 
 variables:
   GO111MODULE: 'on'
@@ -29,15 +29,6 @@ steps:
     sudo apt-get install -y \
       build-essential \
       golang-go \
-      libyang-dev \
-      libnl-3-dev \
-      libnl-genl-3-dev \
-      curl \
-      git
-    if ! command -v redis-server &> /dev/null; then
-      echo "redis-server not found, installing from source..."
-      sudo apt-get install -y redis
-    fi
     pip install semgrep
   displayName: 'Install dependencies'
 
@@ -45,21 +36,11 @@ steps:
     go version
     python3 --version
     semgrep --version
-    if command -v redis-server &> /dev/null; then
-      redis-server --version
-    else
-      echo "redis-server still not found after install"
-    fi
   displayName: 'Verify environment'
 
 - script: |
     cd sonic-gnmi-standalone
-    make validate-format
-    make tidy
-    make build-all
-    make vet
-    make lint
-    make test
-    make test-coverage
-    make verify
-    make semgrep
+    echo "Running Continuous Integration checks..."
+    ## echo "Hint: you can also run these locally..."
+    make ci
+  displayName: 'Run CI pipeline'
