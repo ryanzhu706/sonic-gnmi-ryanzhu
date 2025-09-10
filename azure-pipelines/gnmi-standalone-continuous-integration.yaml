@@ -1,4 +1,3 @@
-
 trigger:
   branches:
     include:
@@ -19,6 +18,8 @@ variables:
   GOPROXY: 'https://proxy.golang.org'
 
 steps:
+- checkout: self
+
 - task: UsePythonVersion@0
   inputs:
     versionSpec: '3.x'
@@ -30,6 +31,7 @@ steps:
   displayName: 'Install Go 1.19'
 
 - script: |
+    set -euxo pipefail
     sudo apt-get update
     sudo apt-get install -y \
       build-essential \
@@ -39,17 +41,32 @@ steps:
       curl \
       git \
       python3-pip
+    pip install --upgrade pip
     pip install semgrep
   displayName: 'Install minimal dependencies'
 
 - script: |
+    set -euxo pipefail
     go version
     python3 --version
     semgrep --version
   displayName: 'Verify environment'
 
+# NEW: install the exact golangci-lint version expected by your Makefile
 - script: |
+    set -euxo pipefail
     cd sonic-gnmi-standalone
+    make install-golangci-lint
+    # show where it landed and its version
+    export PATH="$PWD/.tools/bin:$(go env GOPATH)/bin:$HOME/.local/bin:$PATH"
+    which golangci-lint
+    golangci-lint version || true
+  displayName: 'Install golangci-lint (Makefile target)'
+
+- script: |
+    set -euxo pipefail
+    cd sonic-gnmi-standalone
+    # ensure the install path is on PATH for this step too
+    export PATH="$PWD/.tools/bin:$(go env GOPATH)/bin:$HOME/.local/bin:$PATH"
     make ci
   displayName: 'Run make ci'
-
